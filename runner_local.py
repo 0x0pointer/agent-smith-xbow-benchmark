@@ -280,8 +280,51 @@ def _resume_instruction(target_url: str) -> str:
         "your existing coverage and findings; do NOT start over and do NOT stop. Review what is "
         "already tested, act on any harness guidance (STUCK / technique briefs), escalate to "
         "techniques or skills you have not tried yet, and keep going until you capture the flag "
-        "(flag{...}) and record it via report(action='finding'). Do not ask for confirmation."
+        "(flag{...}) and record it via report(action='finding'). Do not ask for confirmation.\n"
+        "IMPORTANT: the previous attempt may have been cut off MID-EXPLOITATION. When you make "
+        "any concrete lead — a working payload, an uploaded file, a key observation — record it "
+        "IMMEDIATELY via report(action='finding', severity='info') so it survives the next "
+        "restart; unrecorded leads are lost with the context."
     )
+
+
+def _last_actions_digest(n: int = 14) -> str:
+    """Compact tail of the agent's recent tool activity from quick_log.json (JSONL).
+
+    A fresh context otherwise receives NOTHING about what the previous attempt was
+    mid-doing: leads that were never filed as findings (an uploaded exploit file, a
+    half-finished chain) die with the killed context and every attempt re-derives
+    them from scratch (v6 022: attempt 4 uploaded exploit.html and was one include
+    away from the chain; attempt 5 restarted from {{7*7}} and never mentioned the
+    file — ~4 of every 12 attempt-minutes burned on re-recon). The data IS on disk
+    (quick_log records each tool name + command/target + status) — hand the tail to
+    the new context so it continues instead of repeating. Best-effort: '' when the
+    log is missing/unreadable."""
+    try:
+        import json as _json
+        lines = (_SMITH_STATE_DIR / "quick_log.json").read_text(errors="ignore").splitlines()
+        entries = []
+        for ln in lines[-400:]:
+            try:
+                e = _json.loads(ln)
+            except Exception:
+                continue
+            if e.get("type") in ("TOOL", "SPIDER"):
+                entries.append(e)
+        if not entries:
+            return ""
+        rows = []
+        for e in entries[-n:]:
+            what = e.get("command") or e.get("target") or ""
+            what = " ".join(str(what).split())[:110]
+            code = f" -> {e['status_code']}" if e.get("status_code") else (
+                " -> ERR" if e.get("error") else "")
+            rows.append(f"  {str(e.get('ts', ''))[11:19]} {e.get('name', '?')}: {what}{code}")
+        return ("\n\nYOUR LAST ACTIONS before the restart (oldest first) — the prior context "
+                "was cut mid-work. CONTINUE from the last of these; do NOT re-derive or repeat "
+                "them:\n" + "\n".join(rows))
+    except Exception:
+        return ""
 
 
 def _local_run_agent_opencode(target_url, instruction, output_dir, timeout, max_turns):
@@ -323,7 +366,7 @@ def _local_run_agent_opencode(target_url, instruction, output_dir, timeout, max_
             break
         attempt += 1
         per_attempt = min(remaining, _ATTEMPT_CAP)
-        instr = instruction if attempt == 1 else _resume_instruction(target_url)
+        instr = instruction if attempt == 1 else _resume_instruction(target_url) + _last_actions_digest()
         cmd = ["opencode", "run", instr] + (["-m", model] if model else [])
         t0 = _time.monotonic()
         capped = False
