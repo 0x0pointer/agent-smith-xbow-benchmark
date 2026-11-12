@@ -254,6 +254,48 @@ _FLAG_RE = _re.compile(r"flag\{[0-9A-Za-z_-]{6,}\}")
 #: better than one long 70-min context. Tune via AGENT_SMITH_ATTEMPT_CAP_SECS.
 _ATTEMPT_CAP = int(os.environ.get("AGENT_SMITH_ATTEMPT_CAP_SECS", "720"))  # 12 min
 
+#: Activity-aware extension: when the flat cap fires, the attempt is granted extra
+#: chunks ONLY while the agent is demonstrably mid-work (recent + diverse tool calls),
+#: never past this per-attempt ceiling. Keeps the cap's anti-rut guarantee (v4: one
+#: 70-min context, 66 tools, looping, unsolved) while not murdering a productive
+#: chain mid-step (v6 022 attempt 4: exploit.html uploaded, one include from the
+#: flag — killed at exactly 720s). Tune via AGENT_SMITH_ATTEMPT_MAX_SECS.
+_ATTEMPT_MAX = int(os.environ.get("AGENT_SMITH_ATTEMPT_MAX_SECS", "1800"))  # 30 min hard ceiling
+_EXT_CHUNK_SECS = 240       # renewable extension granularity
+_ACTIVE_GRACE_SECS = 90     # last tool call older than this → silent, not mid-work
+_EXT_WINDOW = 10            # diversity window (last N tool actions)
+_EXT_MIN_UNIQUE = 3         # ≥ this many distinct commands in the window → not a tight loop
+
+
+def _attempt_is_productive() -> bool:
+    """At an attempt-cap boundary: is the agent demonstrably MID-WORK?
+
+    True iff its last logged action is recent (silent stretches are ruts) AND the
+    recent actions are diverse (a tight repeat-loop is a rut even when loud).
+    Reads quick_log.json (JSONL) best-effort; any failure → False (cut, as before)."""
+    try:
+        import json as _json
+        from datetime import datetime as _dt, timezone as _tz
+        lines = (_SMITH_STATE_DIR / "quick_log.json").read_text(errors="ignore").splitlines()
+        entries = []
+        for ln in lines[-400:]:
+            try:
+                e = _json.loads(ln)
+            except Exception:
+                continue
+            if e.get("type") in ("TOOL", "SPIDER"):
+                entries.append(e)
+        if not entries:
+            return False
+        last = _dt.fromisoformat(entries[-1]["ts"])
+        if (_dt.now(_tz.utc) - last).total_seconds() > _ACTIVE_GRACE_SECS:
+            return False                                   # silent → cut
+        sigs = {str(e.get("command") or e.get("target") or "")[:80]
+                for e in entries[-_EXT_WINDOW:]}
+        return len(sigs) >= _EXT_MIN_UNIQUE                 # diverse → mid-chain
+    except Exception:
+        return False
+
 
 def _flag_captured(output_dir) -> bool:
     """Has the agent captured a flag this lab? Checked between keep-pushing attempts so
@@ -351,7 +393,11 @@ def _local_run_agent_opencode(target_url, instruction, output_dir, timeout, max_
     # (022 v5: 207 tools across ~7 fresh contexts) — but note it does NOT crack the
     # exploit-construction wall: 022 remained unsolved in v5. The runner caps each attempt
     # at _ATTEMPT_CAP and re-launches on the SAME target — session.start() resumes prior
-    # coverage/findings — until the flag lands or the budget is spent. This replaces the
+    # coverage/findings — until the flag lands or the budget is spent. The flat
+    # _ATTEMPT_CAP is ACTIVITY-AWARE: an agent demonstrably mid-work at the boundary
+    # (recent + diverse tool calls) gets renewable extension chunks up to
+    # _ATTEMPT_MAX, so a productive chain isn't cut mid-step; a silent or
+    # repeat-looping agent is cut at the cap as before. This replaces the
     # api_server watchdog's restart-on-stall (which raced this runner and left zombies on
     # stale sessions): one driver, no zombies. The watchdog now auto-silences itself for
     # scan_mode=benchmark scans (per-tick), so no .env flag needs flipping for this loop.
@@ -369,21 +415,46 @@ def _local_run_agent_opencode(target_url, instruction, output_dir, timeout, max_
         instr = instruction if attempt == 1 else _resume_instruction(target_url) + _last_actions_digest()
         cmd = ["opencode", "run", instr] + (["-m", model] if model else [])
         t0 = _time.monotonic()
+        attempt_ceiling = t0 + min(_ATTEMPT_MAX, remaining)   # hard per-attempt ceiling
         capped = False
-        try:
-            with open(stdout_file, "w" if attempt == 1 else "a") as fout, \
-                 open(stderr_file, "w" if attempt == 1 else "a") as ferr:
-                if attempt > 1:
-                    fout.write(f"\n\n===== runner keep-pushing · fresh context · attempt {attempt} · {remaining}s left =====\n")
-                    print(f"  re-launching in a fresh context (attempt {attempt}, {remaining}s left)")
-                r = subprocess.run(
-                    cmd, cwd=str(runner.AGENT_SMITH_DIR),
-                    stdout=fout, stderr=ferr, timeout=per_attempt, text=True,
-                )
-            exit_code = r.returncode
-        except subprocess.TimeoutExpired:
-            capped = True                         # hit the per-attempt cap (or the budget); opencode killed
-            exit_code = -1
+        with open(stdout_file, "w" if attempt == 1 else "a") as fout, \
+             open(stderr_file, "w" if attempt == 1 else "a") as ferr:
+            if attempt > 1:
+                fout.write(f"\n\n===== runner keep-pushing · fresh context · attempt {attempt} · {remaining}s left =====\n")
+                print(f"  re-launching in a fresh context (attempt {attempt}, {remaining}s left)")
+            proc = subprocess.Popen(cmd, cwd=str(runner.AGENT_SMITH_DIR),
+                                    stdout=fout, stderr=ferr, text=True)
+            # Poll instead of subprocess.run(timeout=…): when the flat cap fires we may
+            # EXTEND the deadline (activity-aware) instead of killing mid-chain. The
+            # agent that is demonstrably mid-work (recent + diverse actions — v6 022
+            # attempt 4 was one include from the flag when the flat 720s wall killed
+            # it) gets renewable chunks up to _ATTEMPT_MAX; a silent or repeat-looping
+            # agent is cut at the cap exactly as before (the v4 anti-rut guarantee).
+            deadline_at = t0 + per_attempt
+            while True:
+                try:
+                    proc.wait(timeout=5)
+                    exit_code = proc.returncode
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                now = _time.monotonic()
+                if now < deadline_at:
+                    continue
+                if (now < attempt_ceiling - 5
+                        and int(deadline - now) > 45
+                        and _attempt_is_productive()):
+                    deadline_at = min(now + _EXT_CHUNK_SECS, attempt_ceiling, deadline - 45)
+                    print(f"  attempt {attempt}: agent mid-chain at cap — extending to {int(deadline_at - t0)}s")
+                else:
+                    capped = True                           # hit the cap; opencode killed
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    exit_code = -1
+                    break
         if _flag_captured(output_dir):
             print(f"  flag captured on attempt {attempt}")
             break
