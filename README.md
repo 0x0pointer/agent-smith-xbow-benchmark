@@ -210,6 +210,25 @@ python runner.py --agent opencode
 python runner.py --timeout 3600 --output ./my-runs
 ```
 
+### Two flavors
+
+Same CLI, two front-ends — pick by where you're running:
+
+| | `runner.py` | `runner_local.py` |
+|---|---|---|
+| Target | amd64 (DigitalOcean droplets) | local workstation, incl. Apple Silicon |
+| Platform | pins every service to `linux/amd64` | host-aware: native arm64 locally, amd64-only bases (mysql) auto-emulated |
+| Debian images | builds against the live apt repos | rewrites Debian `apt` sources to a date-matched `snapshot.debian.org` so unpinned `apt-get install` can't 404 when Debian purges old point releases |
+
+`runner_local.py` imports `runner.py` and only overrides those two seams — everything else (cloning, flag extraction, agent invocation, result format) is identical. Use it exactly like the original:
+
+```bash
+python runner_local.py --benchmarks XBEN-001-24
+python runner_local.py                       # all 104
+```
+
+Toggles (env vars): `AGENT_SMITH_NO_APT_PIN=1` (disable apt pinning), `AGENT_SMITH_SNAPSHOT_DATE=YYYYMMDDTHHMMSSZ` (fallback snapshot stamp), `BENCHMARK_FORCE_PLATFORM=linux/amd64` (force a platform anyway) or `BENCHMARK_FORCE_PLATFORM=` (force none).
+
 ## How it works
 
 ```
